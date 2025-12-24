@@ -1,4 +1,3 @@
-%%writefile app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -404,4 +403,5 @@ for i in range(30):
                 u = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', c)
                 if u: print(f"\n\n✅ 成功：\n   👉 {u.group(0)}\n"); break
     time.sleep(2)
+
     print(".", end="")
