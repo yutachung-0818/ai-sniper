@@ -374,7 +374,6 @@ import os
 import subprocess
 
 print("🧹 清理中...")
-!pkill cloudflared
 
 print("📦 安裝套件...")
 !pip install -q xgboost streamlit yfinance plotly pyngrok scikit-learn scipy
@@ -404,4 +403,5 @@ for i in range(30):
     time.sleep(2)
 
     print(".", end="")
+
 
