@@ -14,7 +14,7 @@ import io
 # --- 頁面設定 ---
 st.set_page_config(page_title="AI Sniper: Ultimate Edition", layout="wide")
 
-# --- CSS ---
+# --- CSS 優化 ---
 st.markdown("""
 <style>
     .verdict-box { padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px; }
@@ -26,6 +26,8 @@ st.markdown("""
     .tp-text { color: #00E676; font-weight: bold; }
     .sl-text { color: #FF5252; font-weight: bold; }
     .scan-card { background-color: #1E1E1E; padding: 10px; border: 1px solid #444; border-radius: 5px; margin-bottom: 5px;}
+    .tag-bull { background-color: #004d40; color: #00E676; padding: 2px 8px; border-radius: 4px; font-size: 12px; border: 1px solid #00E676; }
+    .tag-bear { background-color: #3e2723; color: #FF5252; padding: 2px 8px; border-radius: 4px; font-size: 12px; border: 1px solid #FF5252; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,7 +44,7 @@ def get_data_smart(ticker, market_type):
 
     df, stock_obj = try_download(ticker)
     
-    # 台股後綴自動切換
+    # 台股後綴自動切換 (防呆機制)
     if (df.empty or len(df) < 50) and "台股" in market_type:
         alt = ticker.replace(".TW", ".TWO") if ticker.endswith(".TW") else ticker.replace(".TWO", ".TW")
         st.toast(f"🔄 嘗試切換代碼: {alt}")
@@ -50,25 +52,33 @@ def get_data_smart(ticker, market_type):
             
     if df.empty or len(df) < 150: return None, None, "DATA_TOO_SHORT"
     
+    # 補值
     df = df.ffill().bfill()
     
+    # 抓取大盤基準
     try:
         bm_ticker = "0050.TW" if "台股" in market_type else "SPY"
         bm = yf.Ticker(bm_ticker).history(period="2y")
+        # 對齊索引並補值
         df['BM_Close'] = bm['Close'].reindex(df.index, method='ffill').ffill().bfill()
-    except: df['BM_Close'] = df['Close']
+    except: 
+        df['BM_Close'] = df['Close']
         
     df['Rel_Str'] = df['Close'] / df['BM_Close']
     return df, stock_obj, "OK"
 
 def get_options_data(stock_obj):
-    """ 恢復選擇權分析 """
+    """ 獲取選擇權 Put/Call Ratio """
     try:
         dates = stock_obj.options
         if not dates: return None
+        # 抓最近期合約
         chain = stock_obj.option_chain(dates[0])
-        calls = chain.calls['volume'].sum() if chain.calls['volume'].sum() > 0 else 1
+        calls = chain.calls['volume'].sum() 
         puts = chain.puts['volume'].sum()
+        
+        if calls == 0: calls = 1 # 避免除以零
+        
         pcr = round(puts / calls, 2)
         sent = "極度避險(看漲?)" if pcr > 1.2 else ("極度樂觀(看跌?)" if pcr < 0.6 else "中性")
         return {"pcr": pcr, "sent": sent, "c": calls, "p": puts}
@@ -88,6 +98,7 @@ def feature_engineering(df):
         data['Log_Ret'] = np.log(data['Close'] / data['Close'].shift(1))
         data['Vol'] = data['Log_Ret'].rolling(20).std()
         
+        # 籌碼 POC
         price_bins = pd.cut(data['Close'], bins=50)
         vol_profile = data.groupby(price_bins, observed=True)['Volume'].sum()
         data['POC'] = vol_profile.idxmax().mid
@@ -98,6 +109,7 @@ def feature_engineering(df):
         data['ATR'] = data['TR'].rolling(14).mean()
         data['Target'] = (data['Close'].shift(-5) > data['Close']).astype(int)
         
+        # 清洗數據
         valid_data = data.dropna()
         if len(valid_data) < 100: return None
         data = data.ffill().bfill()
@@ -105,11 +117,12 @@ def feature_engineering(df):
     except: return None
 
 # ==========================================
-# 2. 三大 AI 模型 (恢復詳細權重)
+# 2. 三大 AI 模型 (AI Council)
 # ==========================================
 
 def run_ensemble_models(df, opt_data=None):
     features = ['RSI', 'Vol', 'MA20', 'ATR']
+    # 分割訓練與預測集
     train_df = df.iloc[:-5].dropna()
     latest_row = df.iloc[[-1]]
     
@@ -134,14 +147,14 @@ def run_ensemble_models(df, opt_data=None):
         rf_m.fit(X_train_s, y_train)
         p_rf = rf_m.predict_proba(X_latest_s)[0][1]
         
-        # 3. Logistic
+        # 3. Logistic Regression
         lr_m = LogisticRegression()
         lr_m.fit(X_train_s, y_train)
         p_lr = lr_m.predict_proba(X_latest_s)[0][1]
         
         final = (p_xgb * 0.4) + (p_rf * 0.3) + (p_lr * 0.3)
         
-        # 選擇權加權 (若 PCR > 1.2 視為恐慌底，加分)
+        # 選擇權加權 (若 PCR > 1.2 視為恐慌底部，給予加分)
         if opt_data and opt_data['pcr'] > 1.2:
             final = min(final + 0.1, 1.0)
             
@@ -160,12 +173,15 @@ def run_black_litterman(df, ai_prob):
     tau = 0.5
     bl_ret = (mu_mkt + tau * ai_ret) / (1 + tau)
     kelly = (bl_ret - 0.04) / (max(sigma, 0.01)**2)
-    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 # 強勢股強制試單
+    
+    # 策略濾網：若信心不足，建議空手
+    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 # 強勢試單
     elif ai_prob < 0.55: kelly = 0
+        
     return mu_mkt, ai_ret, bl_ret, max(0, min(kelly, 2.0)), sigma
 
 # ==========================================
-# 3. 策略視覺化 (保留新功能)
+# 3. 策略視覺化工具
 # ==========================================
 
 def calculate_strategy_levels(entry_price):
@@ -178,7 +194,7 @@ def calculate_strategy_levels(entry_price):
     }
 
 # ==========================================
-# 4. 全景掃描器 (保留)
+# 4. 全景掃描器 (雙向爆量)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_tickers(mode):
@@ -190,6 +206,7 @@ def get_tickers(mode):
             return [t.replace('.', '-') for t in df['Symbol'].tolist()]
         except: return ['AAPL', 'NVDA', 'TSLA', 'AMD', 'MSFT'] 
     else:
+        # 台股熱門與權值股清單
         return [
             "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2412.TW", "2881.TW", "2882.TW", "2303.TW", "1590.TW",
             "2603.TW", "2609.TW", "2615.TW", "3037.TW", "3231.TW", "2356.TW", "2376.TW", "3017.TW", "3035.TW", "3661.TW",
@@ -205,12 +222,14 @@ def scan_market_panoramic(tickers):
         try:
             df = data[t].ffill().bfill()
             if df.empty or len(df) < 2: continue
+            
             v_now, v_prev = df['Volume'].iloc[-1], df['Volume'].iloc[-2]
             p_now, p_prev = df['Close'].iloc[-1], df['Close'].iloc[-2]
             if v_prev == 0: continue
             v_chg = (v_now - v_prev) / v_prev
             p_chg = (p_now - p_prev) / p_prev
             
+            # 爆量 50%
             if v_chg > 0.5:
                 signal_type = "Bull" if p_chg > 0 else "Bear"
                 res.append({"Code": t, "Price": round(p_now,2), "Chg%": round(p_chg*100,2), "Vol_Chg%": round(v_chg*100,2), "Type": signal_type})
@@ -218,7 +237,7 @@ def scan_market_panoramic(tickers):
     return pd.DataFrame(res)
 
 # ==========================================
-# UI
+# UI 介面
 # ==========================================
 with st.sidebar:
     st.header("🧠 終極核心")
@@ -228,41 +247,56 @@ with st.sidebar:
     if "個股" in app_mode:
         market = st.selectbox("市場", ["tw 台股", "us 美股"])
         raw = st.text_input("代碼", value="1590" if market == "tw 台股" else "NVDA")
+        
+        # 智能後綴處理
         if "台股" in market:
-            ticker = f"{raw}.TW" if not raw.endswith((".TW", ".TWO")) else raw
+            if not raw.endswith(".TW") and not raw.endswith(".TWO"):
+                ticker = f"{raw}.TW"
+            else:
+                ticker = raw
             sym = "NT$"
         else:
             ticker = raw
             sym = "$"
+            
         cap = st.number_input("資金", value=100000)
         run_btn = st.button("🚀 啟動全功能分析")
 
+# --- 模式 1 & 2: 掃描器 ---
 if "掃描" in app_mode:
     t_type = "US" if "美股" in app_mode else "TW"
     st.title(f"📡 {t_type} 全景爆量雷達")
+    st.caption("掃描成交量暴增 > 50% 的標的，即時捕捉市場熱點。")
+    
     if st.button("🔍 開始全景掃描"):
         with st.spinner("掃描中..."):
             df_s = scan_market_panoramic(get_tickers(t_type))
             if not df_s.empty:
                 df_s = df_s.sort_values("Vol_Chg%", ascending=False).head(30)
                 for i, r in df_s.iterrows():
-                    color = "#00E676" if r['Type'] == "Bull" else "#FF5252"
-                    tag = "📈 多方攻擊" if r['Type'] == "Bull" else "📉 空方殺盤"
+                    if r['Type'] == "Bull":
+                        color = "#00E676"
+                        tag = "<span class='tag-bull'>📈 多方攻擊</span>"
+                    else:
+                        color = "#FF5252"
+                        tag = "<span class='tag-bear'>📉 空方殺盤</span>"
+                        
                     st.markdown(f"""
                     <div class="scan-card" style="display:flex; justify-content:space-between; align-items:center;">
-                        <div style="flex:1"><b>{r['Code']}</b> <span style="color:#aaa">${r['Price']}</span><br><span style="font-size:12px;color:{color}">{tag}</span></div>
+                        <div style="flex:1"><b>{r['Code']}</b> <span style="color:#aaa">${r['Price']}</span><br>{tag}</div>
                         <div style="flex:1; text-align:right;"><span style="font-size:16px;color:#29B6F6">量增 +{r['Vol_Chg%']}%</span></div>
                     </div>""", unsafe_allow_html=True)
             else: st.warning("今日無顯著爆量股")
 
+# --- 模式 3: 個股深度分析 ---
 elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
     with st.spinner(f"正在執行 {ticker} 終極健檢 (AI+選擇權+策略)..."):
         df_raw, stock_obj, status = get_data_smart(ticker, market)
     
     if status == "DATA_TOO_SHORT":
-        st.error(f"❌ {ticker} 歷史數據不足。")
+        st.error(f"❌ {ticker} 歷史數據不足，無法分析。")
     elif df_raw is None:
-        st.error(f"❌ 無法獲取數據。")
+        st.error(f"❌ 無法獲取數據，請檢查代碼或市場選擇。")
     else:
         df = feature_engineering(df_raw)
         opt_data = get_options_data(stock_obj)
@@ -274,7 +308,7 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                 prob = res['final']
                 mu, ai, bl, kelly, sig = run_black_litterman(df, prob)
                 
-                # 決策
+                # 決策邏輯
                 curr = df.iloc[-1]
                 price = curr['Close']
                 ma60 = curr['MA60']
@@ -291,7 +325,7 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
 
                 st.title(f"{ticker} 終極決策報告")
                 
-                # 1. 紅綠燈
+                # 1. 大決策紅綠燈
                 st.markdown(f"""
                 <div class="verdict-box" style="background-color:{color}22; border:2px solid {color}">
                     <div class="action-text" style="color:{color}">{msg}</div>
@@ -299,7 +333,7 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                     <div>{desc}</div>
                 </div>""", unsafe_allow_html=True)
                 
-                # 2. 恢復三大模型細節 (AI Council)
+                # 2. AI 委員會 (三大模型)
                 st.subheader("⚖️ AI 委員會 (The Council)")
                 c1, c2, c3 = st.columns(3)
                 def get_vote_color(p): return "#00E676" if p > 0.6 else ("#FF5252" if p < 0.4 else "#FFA15A")
@@ -315,9 +349,8 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                 
                 st.write("")
                 
-                # 3. 選擇權與資金 (左右佈局)
+                # 3. 選擇權與資金管理
                 col_opt, col_fund = st.columns([1, 1])
-                
                 with col_opt:
                     if opt_data:
                         pcr = opt_data['pcr']
@@ -334,7 +367,7 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                 with col_fund:
                     st.markdown(f"""
                     <div class="bl-card">
-                        <h4 style="color:#FFF; margin:0">💰 凱利資金管理</h4>
+                        <h4 style="color:#FFF; margin:0">💰 凱利資金配置</h4>
                         <div style="font-size:24px; font-weight:bold; color:#FFF">{sym}{int(cap*kelly):,}</div>
                         <div>建議配置比例: {int(kelly*100)}%</div>
                     </div>""", unsafe_allow_html=True)
@@ -368,40 +401,3 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                         <span class="sl-text">2. {sym}{strat['dca2']:.2f}</span> (加10%)
                     </div>
                     """, unsafe_allow_html=True)
-
-import time
-import os
-import subprocess
-
-print("🧹 清理中...")
-
-print("📦 安裝套件...")
-
-if not os.path.exists("cloudflared-linux-amd64"):
-    print("⬇️ 下載 Cloudflared...")
-
-
-print("🚀 啟動系統...")
-with open("streamlit.log", "w") as log_file:
-    subprocess.Popen(["streamlit", "run", "app.py", "--server.port", "8501", "--server.headless", "true"], stdout=log_file, stderr=log_file)
-
-time.sleep(5)
-with open("tunnel.log", "w") as log_file:
-    subprocess.Popen(["./cloudflared-linux-amd64", "tunnel", "--url", "http://localhost:8501"], stdout=log_file, stderr=log_file)
-
-print("⏳ 等待連結...", end="")
-for i in range(30):
-    if os.path.exists("tunnel.log"):
-        with open("tunnel.log", "r") as f:
-            c = f.read()
-            if "trycloudflare.com" in c:
-                import re
-                u = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', c)
-                if u: print(f"\n\n✅ 成功：\n   👉 {u.group(0)}\n"); break
-    time.sleep(2)
-
-    print(".", end="")
-
-
-
-
