@@ -379,8 +379,7 @@ print("📦 安裝套件...")
 
 if not os.path.exists("cloudflared-linux-amd64"):
     print("⬇️ 下載 Cloudflared...")
-    !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-    !chmod +x cloudflared-linux-amd64
+
 
 print("🚀 啟動系統...")
 with open("streamlit.log", "w") as log_file:
@@ -402,6 +401,7 @@ for i in range(30):
     time.sleep(2)
 
     print(".", end="")
+
 
 
 
