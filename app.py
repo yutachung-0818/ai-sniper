@@ -374,7 +374,6 @@ import os
 import subprocess
 
 print("🧹 清理中...")
-!pkill streamlit
 !pkill cloudflared
 
 print("📦 安裝套件...")
@@ -405,3 +404,4 @@ for i in range(30):
     time.sleep(2)
 
     print(".", end="")
+
