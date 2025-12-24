@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+yfinance
+plotly
+xgboost
+scikit-learn
+scipy
+requests
+lxml
+html5lib
