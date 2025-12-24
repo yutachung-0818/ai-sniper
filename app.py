@@ -376,7 +376,6 @@ import subprocess
 print("🧹 清理中...")
 
 print("📦 安裝套件...")
-!pip install -q xgboost streamlit yfinance plotly pyngrok scikit-learn scipy
 
 if not os.path.exists("cloudflared-linux-amd64"):
     print("⬇️ 下載 Cloudflared...")
@@ -403,5 +402,6 @@ for i in range(30):
     time.sleep(2)
 
     print(".", end="")
+
 
 
