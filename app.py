@@ -23,8 +23,9 @@ st.markdown("""
     .metric-box { background-color: #262730; padding: 15px; border-radius: 8px; border-left: 5px solid #555; height: 100%; text-align: center; }
     .opt-card { background-color: #2b0030; padding: 15px; border-radius: 8px; border-left: 5px solid #E040FB; margin-bottom: 10px; }
     .strategy-card { background-color: #1E1E1E; padding: 15px; border: 1px solid #333; border-radius: 8px; margin-bottom: 10px; }
-    .tp-text { color: #00E676; font-weight: bold; }
-    .sl-text { color: #FF5252; font-weight: bold; }
+    .tp-text { color: #00E676; font-weight: bold; font-size: 16px; }
+    .sl-text { color: #FF5252; font-weight: bold; font-size: 16px; }
+    .ts-text { color: #29B6F6; font-weight: bold; font-size: 16px; }
     .scan-card { background-color: #1E1E1E; padding: 10px; border: 1px solid #444; border-radius: 5px; margin-bottom: 5px;}
     .tag-bull { background-color: #004d40; color: #00E676; padding: 2px 8px; border-radius: 4px; font-size: 12px; border: 1px solid #00E676; }
     .tag-bear { background-color: #3e2723; color: #FF5252; padding: 2px 8px; border-radius: 4px; font-size: 12px; border: 1px solid #FF5252; }
@@ -81,7 +82,7 @@ def get_options_data(stock_obj):
         
         pcr = round(puts / calls, 2)
         sent = "極度避險(看漲?)" if pcr > 1.2 else ("極度樂觀(看跌?)" if pcr < 0.6 else "中性")
-        return {"pcr": pcr, "sent": sent, "c": calls, "p": puts}
+        return {"pcr": pcr, "sent": sent, "c": int(calls), "p": int(puts)}
     except: return None
 
 def feature_engineering(df):
@@ -175,26 +176,43 @@ def run_black_litterman(df, ai_prob):
     kelly = (bl_ret - 0.04) / (max(sigma, 0.01)**2)
     
     # 策略濾網：若信心不足，建議空手
-    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 # 強勢試單
+    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 # 強勢股強制試單
     elif ai_prob < 0.55: kelly = 0
-        
-    return mu_mkt, ai_ret, bl_ret, max(0, min(kelly, 2.0)), sigma
+    
+    # [修正] 凱利上限：單筆不超過 50%
+    kelly = max(0, min(kelly, 0.5))
+    
+    return mu_mkt, ai_ret, bl_ret, kelly, sigma
 
 # ==========================================
-# 3. 策略視覺化工具
+# 3. 策略視覺化 (邏輯修正版)
 # ==========================================
 
-def calculate_strategy_levels(entry_price):
+def calculate_strategy_levels(entry_price, df):
+    curr = df.iloc[-1]
+    atr = curr['ATR']
+    
+    # 停利：
+    tp1 = entry_price * 1.30
+    tp2 = entry_price * 2.00
+    
+    # 加碼：根據 ATR 計算
+    dca_1 = entry_price - (1.0 * atr) 
+    dca_2 = entry_price - (2.5 * atr)
+    
+    # 移動鎖利 (Trailing Stop)
+    # 邏輯：必須比 DCA_2 還要低，否則會出現矛盾
+    recent_low = df['Low'].iloc[-20:].min()
+    trailing_stop = min(recent_low, dca_2 * 0.95) 
+    
     return {
-        "tp1": entry_price * 1.30,  # +30%
-        "tp2": entry_price * 2.00,  # +100%
-        "dca1": entry_price * 0.90, # -10%
-        "dca2": entry_price * 0.80, # -20%
-        "dca3": entry_price * 0.70  # -30%
+        "tp1": tp1, "tp2": tp2,
+        "dca1": dca_1, "dca2": dca_2,
+        "ts": trailing_stop
     }
 
 # ==========================================
-# 4. 全景掃描器 (雙向爆量)
+# 4. 全景掃描器
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_tickers(mode):
@@ -222,14 +240,12 @@ def scan_market_panoramic(tickers):
         try:
             df = data[t].ffill().bfill()
             if df.empty or len(df) < 2: continue
-            
             v_now, v_prev = df['Volume'].iloc[-1], df['Volume'].iloc[-2]
             p_now, p_prev = df['Close'].iloc[-1], df['Close'].iloc[-2]
             if v_prev == 0: continue
             v_chg = (v_now - v_prev) / v_prev
             p_chg = (p_now - p_prev) / p_prev
             
-            # 爆量 50%
             if v_chg > 0.5:
                 signal_type = "Bull" if p_chg > 0 else "Bear"
                 res.append({"Code": t, "Price": round(p_now,2), "Chg%": round(p_chg*100,2), "Vol_Chg%": round(v_chg*100,2), "Type": signal_type})
@@ -247,56 +263,41 @@ with st.sidebar:
     if "個股" in app_mode:
         market = st.selectbox("市場", ["tw 台股", "us 美股"])
         raw = st.text_input("代碼", value="1590" if market == "tw 台股" else "NVDA")
-        
-        # 智能後綴處理
         if "台股" in market:
-            if not raw.endswith(".TW") and not raw.endswith(".TWO"):
-                ticker = f"{raw}.TW"
-            else:
-                ticker = raw
+            ticker = f"{raw}.TW" if not raw.endswith((".TW", ".TWO")) else raw
             sym = "NT$"
         else:
             ticker = raw
             sym = "$"
-            
         cap = st.number_input("資金", value=100000)
         run_btn = st.button("🚀 啟動全功能分析")
 
-# --- 模式 1 & 2: 掃描器 ---
 if "掃描" in app_mode:
     t_type = "US" if "美股" in app_mode else "TW"
     st.title(f"📡 {t_type} 全景爆量雷達")
-    st.caption("掃描成交量暴增 > 50% 的標的，即時捕捉市場熱點。")
-    
     if st.button("🔍 開始全景掃描"):
         with st.spinner("掃描中..."):
             df_s = scan_market_panoramic(get_tickers(t_type))
             if not df_s.empty:
                 df_s = df_s.sort_values("Vol_Chg%", ascending=False).head(30)
                 for i, r in df_s.iterrows():
-                    if r['Type'] == "Bull":
-                        color = "#00E676"
-                        tag = "<span class='tag-bull'>📈 多方攻擊</span>"
-                    else:
-                        color = "#FF5252"
-                        tag = "<span class='tag-bear'>📉 空方殺盤</span>"
-                        
+                    color = "#00E676" if r['Type'] == "Bull" else "#FF5252"
+                    tag = "📈 多方攻擊" if r['Type'] == "Bull" else "📉 空方殺盤"
                     st.markdown(f"""
                     <div class="scan-card" style="display:flex; justify-content:space-between; align-items:center;">
-                        <div style="flex:1"><b>{r['Code']}</b> <span style="color:#aaa">${r['Price']}</span><br>{tag}</div>
+                        <div style="flex:1"><b>{r['Code']}</b> <span style="color:#aaa">${r['Price']}</span><br><span style="font-size:12px;color:{color}">{tag}</span></div>
                         <div style="flex:1; text-align:right;"><span style="font-size:16px;color:#29B6F6">量增 +{r['Vol_Chg%']}%</span></div>
                     </div>""", unsafe_allow_html=True)
             else: st.warning("今日無顯著爆量股")
 
-# --- 模式 3: 個股深度分析 ---
 elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
     with st.spinner(f"正在執行 {ticker} 終極健檢 (AI+選擇權+策略)..."):
         df_raw, stock_obj, status = get_data_smart(ticker, market)
     
     if status == "DATA_TOO_SHORT":
-        st.error(f"❌ {ticker} 歷史數據不足，無法分析。")
+        st.error(f"❌ {ticker} 歷史數據不足。")
     elif df_raw is None:
-        st.error(f"❌ 無法獲取數據，請檢查代碼或市場選擇。")
+        st.error(f"❌ 無法獲取數據。")
     else:
         df = feature_engineering(df_raw)
         opt_data = get_options_data(stock_obj)
@@ -308,7 +309,6 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                 prob = res['final']
                 mu, ai, bl, kelly, sig = run_black_litterman(df, prob)
                 
-                # 決策邏輯
                 curr = df.iloc[-1]
                 price = curr['Close']
                 ma60 = curr['MA60']
@@ -325,7 +325,6 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
 
                 st.title(f"{ticker} 終極決策報告")
                 
-                # 1. 大決策紅綠燈
                 st.markdown(f"""
                 <div class="verdict-box" style="background-color:{color}22; border:2px solid {color}">
                     <div class="action-text" style="color:{color}">{msg}</div>
@@ -333,23 +332,21 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                     <div>{desc}</div>
                 </div>""", unsafe_allow_html=True)
                 
-                # 2. AI 委員會 (三大模型)
                 st.subheader("⚖️ AI 委員會 (The Council)")
                 c1, c2, c3 = st.columns(3)
                 def get_vote_color(p): return "#00E676" if p > 0.6 else ("#FF5252" if p < 0.4 else "#FFA15A")
                 with c1:
                     st.markdown(f"""<div class="metric-box" style="border-left-color:{get_vote_color(res['xgb'])}">
-                    <b>XGBoost</b> (趨勢)<br><span style="font-size:24px">{int(res['xgb']*100)}%</span></div>""", unsafe_allow_html=True)
+                    <b>XGBoost</b><br><span style="font-size:24px">{int(res['xgb']*100)}%</span></div>""", unsafe_allow_html=True)
                 with c2:
                     st.markdown(f"""<div class="metric-box" style="border-left-color:{get_vote_color(res['rf'])}">
-                    <b>Random Forest</b> (結構)<br><span style="font-size:24px">{int(res['rf']*100)}%</span></div>""", unsafe_allow_html=True)
+                    <b>Random Forest</b><br><span style="font-size:24px">{int(res['rf']*100)}%</span></div>""", unsafe_allow_html=True)
                 with c3:
                     st.markdown(f"""<div class="metric-box" style="border-left-color:{get_vote_color(res['lr'])}">
-                    <b>Logistic Reg</b> (機率)<br><span style="font-size:24px">{int(res['lr']*100)}%</span></div>""", unsafe_allow_html=True)
+                    <b>Logistic Reg</b><br><span style="font-size:24px">{int(res['lr']*100)}%</span></div>""", unsafe_allow_html=True)
                 
                 st.write("")
                 
-                # 3. 選擇權與資金管理
                 col_opt, col_fund = st.columns([1, 1])
                 with col_opt:
                     if opt_data:
@@ -360,30 +357,30 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                             <h4 style="color:#FFF; margin:0">🟣 選擇權籌碼</h4>
                             <div style="font-size:24px; font-weight:bold; color:{pcr_c}">PCR: {pcr}</div>
                             <div>情緒: {opt_data['sent']}</div>
+                            <div style="font-size:12px;color:#ccc">Call: {opt_data['c']:,} | Put: {opt_data['p']:,}</div>
                         </div>""", unsafe_allow_html=True)
                     else:
                         st.info("⚠️ 無選擇權數據 (僅美股或熱門股提供)")
-                        
                 with col_fund:
                     st.markdown(f"""
                     <div class="bl-card">
                         <h4 style="color:#FFF; margin:0">💰 凱利資金配置</h4>
                         <div style="font-size:24px; font-weight:bold; color:#FFF">{sym}{int(cap*kelly):,}</div>
-                        <div>建議配置比例: {int(kelly*100)}%</div>
+                        <div>建議配置: {int(kelly*100)}% (Max 50%)</div>
                     </div>""", unsafe_allow_html=True)
 
                 st.divider()
 
-                # 4. 策略視覺化 (K線 + 劇本)
-                strat = calculate_strategy_levels(price)
+                strat = calculate_strategy_levels(price, df)
                 
                 c_chart, c_plan = st.columns([2, 1])
                 with c_chart:
                     st.subheader("📊 策略戰術圖")
                     fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線")])
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='yellow', width=2), name='季線'))
-                    fig.add_hline(y=strat['tp1'], line_dash="dash", line_color="#00E676", annotation_text="TP1 (+30%)")
-                    fig.add_hline(y=strat['dca1'], line_dash="dot", line_color="#FF5252", annotation_text="加碼1 (-10%)")
+                    fig.add_hline(y=strat['tp1'], line_dash="dash", line_color="#00E676", annotation_text="TP1")
+                    fig.add_hline(y=strat['dca1'], line_dash="dot", line_color="#FF5252", annotation_text="加碼1")
+                    fig.add_hline(y=strat['ts'], line_dash="solid", line_color="#29B6F6", annotation_text="移動鎖利")
                     fig.update_layout(height=500, margin=dict(l=0,r=0,t=0,b=0))
                     st.plotly_chart(fig, use_container_width=True)
                     
@@ -399,5 +396,10 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                         <b>🛡️ 加碼防線</b><br>
                         <span class="sl-text">1. {sym}{strat['dca1']:.2f}</span> (加10%)<br>
                         <span class="sl-text">2. {sym}{strat['dca2']:.2f}</span> (加10%)
+                    </div>
+                    <div class="strategy-card" style="border-left-color:#29B6F6">
+                        <b>🛑 最終防線 (Trailing Stop)</b><br>
+                        <span class="ts-text">{sym}{strat['ts']:.2f}</span><br>
+                        <span style="font-size:12px;color:#aaa">跌破此線全數清倉</span>
                     </div>
                     """, unsafe_allow_html=True)
