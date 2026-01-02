@@ -12,9 +12,9 @@ import requests
 import io
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="AI Sniper: Ultimate Edition", layout="wide")
+st.set_page_config(page_title="AI Sniper: Portfolio Manager", layout="wide")
 
-# --- CSS 優化 ---
+# --- CSS ---
 st.markdown("""
 <style>
     .verdict-box { padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px; }
@@ -23,6 +23,7 @@ st.markdown("""
     .metric-box { background-color: #262730; padding: 15px; border-radius: 8px; border-left: 5px solid #555; height: 100%; text-align: center; }
     .opt-card { background-color: #2b0030; padding: 15px; border-radius: 8px; border-left: 5px solid #E040FB; margin-bottom: 10px; }
     .strategy-card { background-color: #1E1E1E; padding: 15px; border: 1px solid #333; border-radius: 8px; margin-bottom: 10px; }
+    .pnl-card { background-color: #1a237e; padding: 15px; border-radius: 8px; border-left: 5px solid #536DFE; margin-bottom: 10px; }
     .tp-text { color: #00E676; font-weight: bold; font-size: 16px; }
     .sl-text { color: #FF5252; font-weight: bold; font-size: 16px; }
     .ts-text { color: #29B6F6; font-weight: bold; font-size: 16px; }
@@ -33,7 +34,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 數據層 (含選擇權與防呆)
+# 1. 數據層
 # ==========================================
 
 def get_data_smart(ticker, market_type):
@@ -45,7 +46,6 @@ def get_data_smart(ticker, market_type):
 
     df, stock_obj = try_download(ticker)
     
-    # 台股後綴自動切換 (防呆機制)
     if (df.empty or len(df) < 50) and "台股" in market_type:
         alt = ticker.replace(".TW", ".TWO") if ticker.endswith(".TW") else ticker.replace(".TWO", ".TW")
         st.toast(f"🔄 嘗試切換代碼: {alt}")
@@ -53,33 +53,25 @@ def get_data_smart(ticker, market_type):
             
     if df.empty or len(df) < 150: return None, None, "DATA_TOO_SHORT"
     
-    # 補值
     df = df.ffill().bfill()
     
-    # 抓取大盤基準
     try:
         bm_ticker = "0050.TW" if "台股" in market_type else "SPY"
         bm = yf.Ticker(bm_ticker).history(period="2y")
-        # 對齊索引並補值
         df['BM_Close'] = bm['Close'].reindex(df.index, method='ffill').ffill().bfill()
-    except: 
-        df['BM_Close'] = df['Close']
+    except: df['BM_Close'] = df['Close']
         
     df['Rel_Str'] = df['Close'] / df['BM_Close']
     return df, stock_obj, "OK"
 
 def get_options_data(stock_obj):
-    """ 獲取選擇權 Put/Call Ratio """
     try:
         dates = stock_obj.options
         if not dates: return None
-        # 抓最近期合約
         chain = stock_obj.option_chain(dates[0])
         calls = chain.calls['volume'].sum() 
         puts = chain.puts['volume'].sum()
-        
-        if calls == 0: calls = 1 # 避免除以零
-        
+        if calls == 0: calls = 1
         pcr = round(puts / calls, 2)
         sent = "極度避險(看漲?)" if pcr > 1.2 else ("極度樂觀(看跌?)" if pcr < 0.6 else "中性")
         return {"pcr": pcr, "sent": sent, "c": int(calls), "p": int(puts)}
@@ -99,7 +91,6 @@ def feature_engineering(df):
         data['Log_Ret'] = np.log(data['Close'] / data['Close'].shift(1))
         data['Vol'] = data['Log_Ret'].rolling(20).std()
         
-        # 籌碼 POC
         price_bins = pd.cut(data['Close'], bins=50)
         vol_profile = data.groupby(price_bins, observed=True)['Volume'].sum()
         data['POC'] = vol_profile.idxmax().mid
@@ -110,7 +101,6 @@ def feature_engineering(df):
         data['ATR'] = data['TR'].rolling(14).mean()
         data['Target'] = (data['Close'].shift(-5) > data['Close']).astype(int)
         
-        # 清洗數據
         valid_data = data.dropna()
         if len(valid_data) < 100: return None
         data = data.ffill().bfill()
@@ -118,15 +108,13 @@ def feature_engineering(df):
     except: return None
 
 # ==========================================
-# 2. 三大 AI 模型 (AI Council)
+# 2. AI 模型
 # ==========================================
 
 def run_ensemble_models(df, opt_data=None):
     features = ['RSI', 'Vol', 'MA20', 'ATR']
-    # 分割訓練與預測集
     train_df = df.iloc[:-5].dropna()
     latest_row = df.iloc[[-1]]
-    
     X_train = train_df[features]
     y_train = train_df['Target']
     X_latest = latest_row[features]
@@ -138,30 +126,22 @@ def run_ensemble_models(df, opt_data=None):
         X_train_s = scaler.fit_transform(X_train)
         X_latest_s = scaler.transform(X_latest)
         
-        # 1. XGBoost
         xgb_m = xgb.XGBClassifier(n_estimators=50, max_depth=3, eval_metric='logloss', use_label_encoder=False)
         xgb_m.fit(X_train_s, y_train)
         p_xgb = xgb_m.predict_proba(X_latest_s)[0][1]
         
-        # 2. Random Forest
         rf_m = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
         rf_m.fit(X_train_s, y_train)
         p_rf = rf_m.predict_proba(X_latest_s)[0][1]
         
-        # 3. Logistic Regression
         lr_m = LogisticRegression()
         lr_m.fit(X_train_s, y_train)
         p_lr = lr_m.predict_proba(X_latest_s)[0][1]
         
         final = (p_xgb * 0.4) + (p_rf * 0.3) + (p_lr * 0.3)
-        
-        # 選擇權加權 (若 PCR > 1.2 視為恐慌底部，給予加分)
-        if opt_data and opt_data['pcr'] > 1.2:
-            final = min(final + 0.1, 1.0)
-            
+        if opt_data and opt_data['pcr'] > 1.2: final = min(final + 0.1, 1.0)
         threshold = 0.6
         con = sum([1 if p > threshold else 0 for p in [p_xgb, p_rf, p_lr]])
-        
         return {"final": final, "con": con, "xgb": p_xgb, "rf": p_rf, "lr": p_lr}
     except: return None
 
@@ -174,45 +154,45 @@ def run_black_litterman(df, ai_prob):
     tau = 0.5
     bl_ret = (mu_mkt + tau * ai_ret) / (1 + tau)
     kelly = (bl_ret - 0.04) / (max(sigma, 0.01)**2)
-    
-    # 策略濾網：若信心不足，建議空手
-    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 # 強勢股強制試單
+    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 
     elif ai_prob < 0.55: kelly = 0
-    
-    # [修正] 凱利上限：單筆不超過 50%
     kelly = max(0, min(kelly, 0.5))
-    
     return mu_mkt, ai_ret, bl_ret, kelly, sigma
 
 # ==========================================
-# 3. 策略視覺化 (邏輯修正版)
+# 3. 策略視覺化 (支援持倉成本)
 # ==========================================
 
-def calculate_strategy_levels(entry_price, df):
+def calculate_strategy_levels(current_price, df, cost_basis=0):
     curr = df.iloc[-1]
     atr = curr['ATR']
-    
-    # 停利：
-    tp1 = entry_price * 1.30
-    tp2 = entry_price * 2.00
-    
-    # 加碼：根據 ATR 計算
-    dca_1 = entry_price - (1.0 * atr) 
-    dca_2 = entry_price - (2.5 * atr)
-    
-    # 移動鎖利 (Trailing Stop)
-    # 邏輯：必須比 DCA_2 還要低，否則會出現矛盾
     recent_low = df['Low'].iloc[-20:].min()
-    trailing_stop = min(recent_low, dca_2 * 0.95) 
+    
+    # 基準價：如果有輸入成本，就用成本算目標；否則用現價算
+    base_price = cost_basis if cost_basis > 0 else current_price
+    
+    # 獲利目標 (根據買入成本)
+    tp1 = base_price * 1.30
+    tp2 = base_price * 2.00
+    
+    # 加碼防線 (DCA)
+    # 如果是持倉狀態，加碼點也應該根據成本往下算 (攤平策略)
+    dca_1 = base_price - (1.0 * atr) 
+    dca_2 = base_price - (2.5 * atr)
+    
+    # 移動鎖利 (Trailing Stop) - 這永遠是跟著股價跑的
+    # 如果已持倉且獲利中，鎖利點不應該低於成本太多
+    trailing_stop = min(recent_low, current_price - 2 * atr)
     
     return {
         "tp1": tp1, "tp2": tp2,
         "dca1": dca_1, "dca2": dca_2,
-        "ts": trailing_stop
+        "ts": trailing_stop,
+        "base": base_price
     }
 
 # ==========================================
-# 4. 全景掃描器
+# 4. 掃描器
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_tickers(mode):
@@ -224,7 +204,6 @@ def get_tickers(mode):
             return [t.replace('.', '-') for t in df['Symbol'].tolist()]
         except: return ['AAPL', 'NVDA', 'TSLA', 'AMD', 'MSFT'] 
     else:
-        # 台股熱門與權值股清單
         return [
             "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2412.TW", "2881.TW", "2882.TW", "2303.TW", "1590.TW",
             "2603.TW", "2609.TW", "2615.TW", "3037.TW", "3231.TW", "2356.TW", "2376.TW", "3017.TW", "3035.TW", "3661.TW",
@@ -245,7 +224,6 @@ def scan_market_panoramic(tickers):
             if v_prev == 0: continue
             v_chg = (v_now - v_prev) / v_prev
             p_chg = (p_now - p_prev) / p_prev
-            
             if v_chg > 0.5:
                 signal_type = "Bull" if p_chg > 0 else "Bear"
                 res.append({"Code": t, "Price": round(p_now,2), "Chg%": round(p_chg*100,2), "Vol_Chg%": round(v_chg*100,2), "Type": signal_type})
@@ -257,7 +235,7 @@ def scan_market_panoramic(tickers):
 # ==========================================
 with st.sidebar:
     st.header("🧠 終極核心")
-    app_mode = st.radio("模式", ["個股深度分析 (All-in-One)", "美股全景掃描", "台股全景掃描"])
+    app_mode = st.radio("模式", ["個股深度分析 (管家版)", "美股全景掃描", "台股全景掃描"])
     st.markdown("---")
     
     if "個股" in app_mode:
@@ -269,8 +247,16 @@ with st.sidebar:
         else:
             ticker = raw
             sym = "$"
-        cap = st.number_input("資金", value=100000)
-        run_btn = st.button("🚀 啟動全功能分析")
+        cap = st.number_input("總資金", value=100000)
+        
+        # --- [新增] 持倉設定 ---
+        st.markdown("### 💼 持倉設定 (Portfolio)")
+        has_pos = st.checkbox("✅ 我已持有此股")
+        cost_basis = 0.0
+        if has_pos:
+            cost_basis = st.number_input("平均買入成本", value=0.0)
+            
+        run_btn = st.button("🚀 啟動分析")
 
 if "掃描" in app_mode:
     t_type = "US" if "美股" in app_mode else "TW"
@@ -291,7 +277,7 @@ if "掃描" in app_mode:
             else: st.warning("今日無顯著爆量股")
 
 elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
-    with st.spinner(f"正在執行 {ticker} 終極健檢 (AI+選擇權+策略)..."):
+    with st.spinner(f"正在執行 {ticker} 終極健檢..."):
         df_raw, stock_obj, status = get_data_smart(ticker, market)
     
     if status == "DATA_TOO_SHORT":
@@ -314,25 +300,52 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                 ma60 = curr['MA60']
                 trend_ok = price > ma60
                 
+                # AI 決策
                 if res['con'] >= 2 and prob > 0.65 and trend_ok:
-                    color = "#00E676"; msg = "強力買進 (Strong Buy)"; desc = "AI 高度共識且順勢"
+                    color = "#00E676"; msg = "強力買進"; desc = "AI 高度共識且順勢"
                 elif res['con'] >= 1 and prob > 0.55 and trend_ok:
-                    color = "#29B6F6"; msg = "偏多操作 (Bullish)"; desc = "趨勢正確"
+                    color = "#29B6F6"; msg = "偏多操作"; desc = "趨勢正確"
                 elif not trend_ok:
-                    color = "#FFA15A"; msg = "觀望 (Hold)"; desc = "股價低於季線"
+                    color = "#FFA15A"; msg = "觀望"; desc = "股價低於季線"
                 else:
-                    color = "#FF5252"; msg = "賣出/空手 (Bearish)"; desc = "AI 看空"
+                    color = "#FF5252"; msg = "賣出/空手"; desc = "AI 看空"
 
-                st.title(f"{ticker} 終極決策報告")
+                st.title(f"{ticker} 決策報告")
                 
-                st.markdown(f"""
-                <div class="verdict-box" style="background-color:{color}22; border:2px solid {color}">
-                    <div class="action-text" style="color:{color}">{msg}</div>
-                    <div class="big-score" style="color:{color}">{int(prob*100)}%</div>
-                    <div>{desc}</div>
-                </div>""", unsafe_allow_html=True)
+                # [新增] 持倉損益卡
+                if has_pos and cost_basis > 0:
+                    pnl = (price - cost_basis) / cost_basis * 100
+                    pnl_money = (price - cost_basis) # 單股損益
+                    pnl_color = "#00E676" if pnl > 0 else "#FF5252"
+                    st.markdown(f"""
+                    <div class="pnl-card">
+                        <h3 style="color:#FFF; margin:0">💼 持倉損益監控</h3>
+                        <div style="display:flex; justify-content:space-around; align-items:center; margin-top:10px;">
+                            <div>
+                                <div style="color:#aaa; font-size:12px">您的成本</div>
+                                <div style="color:#FFF; font-weight:bold; font-size:20px">{sym}{cost_basis}</div>
+                            </div>
+                            <div>
+                                <div style="color:#aaa; font-size:12px">目前損益</div>
+                                <div style="color:{pnl_color}; font-weight:bold; font-size:28px">{pnl:+.2f}%</div>
+                            </div>
+                            <div>
+                                <div style="color:#aaa; font-size:12px">AI 建議</div>
+                                <div style="color:#FFF; font-weight:bold">{msg}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    # 空手時顯示一般決策
+                    st.markdown(f"""
+                    <div class="verdict-box" style="background-color:{color}22; border:2px solid {color}">
+                        <div class="action-text" style="color:{color}">{msg}</div>
+                        <div class="big-score" style="color:{color}">{int(prob*100)}%</div>
+                        <div>{desc}</div>
+                    </div>""", unsafe_allow_html=True)
                 
-                st.subheader("⚖️ AI 委員會 (The Council)")
+                st.subheader("⚖️ AI 委員會")
                 c1, c2, c3 = st.columns(3)
                 def get_vote_color(p): return "#00E676" if p > 0.6 else ("#FF5252" if p < 0.4 else "#FFA15A")
                 with c1:
@@ -357,10 +370,9 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                             <h4 style="color:#FFF; margin:0">🟣 選擇權籌碼</h4>
                             <div style="font-size:24px; font-weight:bold; color:{pcr_c}">PCR: {pcr}</div>
                             <div>情緒: {opt_data['sent']}</div>
-                            <div style="font-size:12px;color:#ccc">Call: {opt_data['c']:,} | Put: {opt_data['p']:,}</div>
                         </div>""", unsafe_allow_html=True)
                     else:
-                        st.info("⚠️ 無選擇權數據 (僅美股或熱門股提供)")
+                        st.info("⚠️ 無選擇權數據")
                 with col_fund:
                     st.markdown(f"""
                     <div class="bl-card">
@@ -371,13 +383,19 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
 
                 st.divider()
 
-                strat = calculate_strategy_levels(price, df)
+                # 計算策略 (傳入成本價)
+                strat = calculate_strategy_levels(price, df, cost_basis if has_pos else 0)
                 
                 c_chart, c_plan = st.columns([2, 1])
                 with c_chart:
                     st.subheader("📊 策略戰術圖")
                     fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線")])
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='yellow', width=2), name='季線'))
+                    
+                    # 畫成本線
+                    if has_pos and cost_basis > 0:
+                        fig.add_hline(y=cost_basis, line_dash="solid", line_color="white", annotation_text="您的成本")
+                        
                     fig.add_hline(y=strat['tp1'], line_dash="dash", line_color="#00E676", annotation_text="TP1")
                     fig.add_hline(y=strat['dca1'], line_dash="dot", line_color="#FF5252", annotation_text="加碼1")
                     fig.add_hline(y=strat['ts'], line_dash="solid", line_color="#29B6F6", annotation_text="移動鎖利")
@@ -385,7 +403,10 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                     st.plotly_chart(fig, use_container_width=True)
                     
                 with c_plan:
-                    st.subheader("📝 交易劇本")
+                    st.subheader("📝 您的劇本")
+                    base_txt = f"基於成本 {cost_basis}" if has_pos else f"基於現價 {price}"
+                    st.caption(base_txt)
+                    
                     st.markdown(f"""
                     <div class="strategy-card" style="border-left-color:#00E676">
                         <b>💰 獲利目標</b><br>
@@ -398,7 +419,7 @@ elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
                         <span class="sl-text">2. {sym}{strat['dca2']:.2f}</span> (加10%)
                     </div>
                     <div class="strategy-card" style="border-left-color:#29B6F6">
-                        <b>🛑 最終防線 (Trailing Stop)</b><br>
+                        <b>🛑 最終防線</b><br>
                         <span class="ts-text">{sym}{strat['ts']:.2f}</span><br>
                         <span style="font-size:12px;color:#aaa">跌破此線全數清倉</span>
                     </div>
