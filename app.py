@@ -138,7 +138,6 @@ if run_btn:
         # 核心驗證與回測
         features = ['RSI', 'ATR_Pct', 'Price_to_MA20', 'Price_to_MA60', 'Vol_Surge', 'MACD_Hist', 'RS', 'Market_Regime']
         
-        # 💡 【重大修復】：過濾掉末端沒有標籤的數據，避免 NaN 進入 accuracy_score
         train_df = df.dropna(subset=['Target'])
         X, y = train_df[features].values, train_df['Target'].values
         dates, atrs, hits = train_df.index, train_df['ATR_Pct'].values, train_df['Hit_Bars'].values
@@ -167,7 +166,7 @@ if run_btn:
 
         oos_acc, base_acc = np.mean(oos_scores), max(y.mean(), 1-y.mean())
         
-        # 今日預測 (使用包含最新一日的完整 df)
+        # 今日預測
         scaler_f = StandardScaler()
         X_s = scaler_f.fit_transform(X)
         m1_f, m2_f, m3_f = get_calibrated_models((len(y)-y.sum())/max(y.sum(),1))
@@ -182,7 +181,8 @@ if run_btn:
         bt_df = bt_df[~bt_df.index.duplicated(keep='first')]
         daily_ret = pd.Series(0.0, index=df.index)
         
-        in_trade_until = pd.Timestamp.min.tz_localize(df.index.tz) if df.index.tz else pd.Timestamp.min
+        # ✅ 使用 2000 年作為安全的過往哨兵值，避開 pd.Timestamp.min 的底層溢位崩潰
+        in_trade_until = pd.Timestamp('2000-01-01', tz=df.index.tz) if df.index.tz else pd.Timestamp('2000-01-01')
         
         for date, row in bt_df.iterrows():
             if date <= in_trade_until: continue
