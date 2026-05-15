@@ -7,420 +7,212 @@ import xgboost as xgb
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from scipy.stats import norm
-import requests
-import io
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score
+from sklearn.calibration import CalibratedClassifierCV
+import warnings
+
+warnings.filterwarnings('ignore')
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="AI Sniper: Portfolio Manager", layout="wide")
+st.set_page_config(page_title="Quant Engine", layout="wide", initial_sidebar_state="expanded")
 
-# --- CSS ---
+# --- CSS 樣式 ---
 st.markdown("""
 <style>
     .verdict-box { padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px; }
-    .action-text { font-size: 30px; font-weight: bold; text-transform: uppercase; }
-    .big-score { font-size: 50px; font-weight: bold; margin: 0; }
-    .metric-box { background-color: #262730; padding: 15px; border-radius: 8px; border-left: 5px solid #555; height: 100%; text-align: center; }
-    .opt-card { background-color: #2b0030; padding: 15px; border-radius: 8px; border-left: 5px solid #E040FB; margin-bottom: 10px; }
+    .action-text { font-size: 26px; font-weight: bold; text-transform: uppercase; }
+    .big-score { font-size: 40px; font-weight: bold; margin: 0; }
+    .metric-box { background-color: #1E1E1E; padding: 15px; border-radius: 8px; border-left: 5px solid #555; text-align: center; }
     .strategy-card { background-color: #1E1E1E; padding: 15px; border: 1px solid #333; border-radius: 8px; margin-bottom: 10px; }
-    .pnl-card { background-color: #1a237e; padding: 15px; border-radius: 8px; border-left: 5px solid #536DFE; margin-bottom: 10px; }
-    .tp-text { color: #00E676; font-weight: bold; font-size: 16px; }
-    .sl-text { color: #FF5252; font-weight: bold; font-size: 16px; }
-    .ts-text { color: #29B6F6; font-weight: bold; font-size: 16px; }
-    .scan-card { background-color: #1E1E1E; padding: 10px; border: 1px solid #444; border-radius: 5px; margin-bottom: 5px;}
-    .tag-bull { background-color: #004d40; color: #00E676; padding: 2px 8px; border-radius: 4px; font-size: 12px; border: 1px solid #00E676; }
-    .tag-bear { background-color: #3e2723; color: #FF5252; padding: 2px 8px; border-radius: 4px; font-size: 12px; border: 1px solid #FF5252; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 數據層
-# ==========================================
-
-def get_data_smart(ticker, market_type):
-    def try_download(symbol):
-        try:
-            d = yf.Ticker(symbol).history(period="2y")
-            return d, yf.Ticker(symbol)
-        except: return pd.DataFrame(), None
-
-    df, stock_obj = try_download(ticker)
-    
-    if (df.empty or len(df) < 50) and "台股" in market_type:
-        alt = ticker.replace(".TW", ".TWO") if ticker.endswith(".TW") else ticker.replace(".TWO", ".TW")
-        st.toast(f"🔄 嘗試切換代碼: {alt}")
-        df, stock_obj = try_download(alt)
-            
-    if df.empty or len(df) < 150: return None, None, "DATA_TOO_SHORT"
-    
-    df = df.ffill().bfill()
-    
-    try:
-        bm_ticker = "0050.TW" if "台股" in market_type else "SPY"
-        bm = yf.Ticker(bm_ticker).history(period="2y")
-        df['BM_Close'] = bm['Close'].reindex(df.index, method='ffill').ffill().bfill()
-    except: df['BM_Close'] = df['Close']
-        
-    df['Rel_Str'] = df['Close'] / df['BM_Close']
-    return df, stock_obj, "OK"
-
-def get_options_data(stock_obj):
-    try:
-        dates = stock_obj.options
-        if not dates: return None
-        chain = stock_obj.option_chain(dates[0])
-        calls = chain.calls['volume'].sum() 
-        puts = chain.puts['volume'].sum()
-        if calls == 0: calls = 1
-        pcr = round(puts / calls, 2)
-        sent = "極度避險(看漲?)" if pcr > 1.2 else ("極度樂觀(看跌?)" if pcr < 0.6 else "中性")
-        return {"pcr": pcr, "sent": sent, "c": int(calls), "p": int(puts)}
-    except: return None
-
-def feature_engineering(df):
-    data = df.copy()
-    try:
-        data['MA20'] = data['Close'].rolling(20).mean()
-        data['MA60'] = data['Close'].rolling(60).mean()
-        
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean().replace(0, 0.001)
-        data['RSI'] = 100 - (100 / (1 + gain/loss))
-        
-        data['Log_Ret'] = np.log(data['Close'] / data['Close'].shift(1))
-        data['Vol'] = data['Log_Ret'].rolling(20).std()
-        
-        price_bins = pd.cut(data['Close'], bins=50)
-        vol_profile = data.groupby(price_bins, observed=True)['Volume'].sum()
-        data['POC'] = vol_profile.idxmax().mid
-        
-        data['TR'] = np.maximum((data['High'] - data['Low']), 
-                                np.maximum(abs(data['High'] - data['Close'].shift(1)), 
-                                           abs(data['Low'] - data['Close'].shift(1))))
-        data['ATR'] = data['TR'].rolling(14).mean()
-        data['Target'] = (data['Close'].shift(-5) > data['Close']).astype(int)
-        
-        valid_data = data.dropna()
-        if len(valid_data) < 100: return None
-        data = data.ffill().bfill()
-        return data
-    except: return None
-
-# ==========================================
-# 2. AI 模型
-# ==========================================
-
-def run_ensemble_models(df, opt_data=None):
-    features = ['RSI', 'Vol', 'MA20', 'ATR']
-    train_df = df.iloc[:-5].dropna()
-    latest_row = df.iloc[[-1]]
-    X_train = train_df[features]
-    y_train = train_df['Target']
-    X_latest = latest_row[features]
-    
-    if len(X_train) < 100: return None
-    
-    try:
-        scaler = StandardScaler()
-        X_train_s = scaler.fit_transform(X_train)
-        X_latest_s = scaler.transform(X_latest)
-        
-        xgb_m = xgb.XGBClassifier(n_estimators=50, max_depth=3, eval_metric='logloss', use_label_encoder=False)
-        xgb_m.fit(X_train_s, y_train)
-        p_xgb = xgb_m.predict_proba(X_latest_s)[0][1]
-        
-        rf_m = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
-        rf_m.fit(X_train_s, y_train)
-        p_rf = rf_m.predict_proba(X_latest_s)[0][1]
-        
-        lr_m = LogisticRegression()
-        lr_m.fit(X_train_s, y_train)
-        p_lr = lr_m.predict_proba(X_latest_s)[0][1]
-        
-        final = (p_xgb * 0.4) + (p_rf * 0.3) + (p_lr * 0.3)
-        if opt_data and opt_data['pcr'] > 1.2: final = min(final + 0.1, 1.0)
-        threshold = 0.6
-        con = sum([1 if p > threshold else 0 for p in [p_xgb, p_rf, p_lr]])
-        return {"final": final, "con": con, "xgb": p_xgb, "rf": p_rf, "lr": p_lr}
-    except: return None
-
-def run_black_litterman(df, ai_prob):
-    returns = df['Log_Ret'].dropna()
-    mu_mkt = returns.mean() * 252 
-    sigma = returns.std() * np.sqrt(252)
-    view = (ai_prob - 0.5) * 3
-    ai_ret = mu_mkt + (view * sigma)
-    tau = 0.5
-    bl_ret = (mu_mkt + tau * ai_ret) / (1 + tau)
-    kelly = (bl_ret - 0.04) / (max(sigma, 0.01)**2)
-    if ai_prob > 0.65 and kelly <= 0: kelly = 0.15 
-    elif ai_prob < 0.55: kelly = 0
-    kelly = max(0, min(kelly, 0.5))
-    return mu_mkt, ai_ret, bl_ret, kelly, sigma
-
-# ==========================================
-# 3. 策略視覺化 (支援持倉成本)
-# ==========================================
-
-def calculate_strategy_levels(current_price, df, cost_basis=0):
-    curr = df.iloc[-1]
-    atr = curr['ATR']
-    recent_low = df['Low'].iloc[-20:].min()
-    
-    # 基準價：如果有輸入成本，就用成本算目標；否則用現價算
-    base_price = cost_basis if cost_basis > 0 else current_price
-    
-    # 獲利目標 (根據買入成本)
-    tp1 = base_price * 1.30
-    tp2 = base_price * 2.00
-    
-    # 加碼防線 (DCA)
-    # 如果是持倉狀態，加碼點也應該根據成本往下算 (攤平策略)
-    dca_1 = base_price - (1.0 * atr) 
-    dca_2 = base_price - (2.5 * atr)
-    
-    # 移動鎖利 (Trailing Stop) - 這永遠是跟著股價跑的
-    # 如果已持倉且獲利中，鎖利點不應該低於成本太多
-    trailing_stop = min(recent_low, current_price - 2 * atr)
-    
-    return {
-        "tp1": tp1, "tp2": tp2,
-        "dca1": dca_1, "dca2": dca_2,
-        "ts": trailing_stop,
-        "base": base_price
-    }
-
-# ==========================================
-# 4. 掃描器
+# 1. 數據層 (僅在獲取原始數據時快取)
 # ==========================================
 @st.cache_data(ttl=3600)
-def get_tickers(mode):
-    if mode == "US":
-        try:
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-            h = {"User-Agent": "Mozilla/5.0"}
-            df = pd.read_html(requests.get(url, headers=h).text)[0]
-            return [t.replace('.', '-') for t in df['Symbol'].tolist()]
-        except: return ['AAPL', 'NVDA', 'TSLA', 'AMD', 'MSFT'] 
-    else:
-        return [
-            "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2412.TW", "2881.TW", "2882.TW", "2303.TW", "1590.TW",
-            "2603.TW", "2609.TW", "2615.TW", "3037.TW", "3231.TW", "2356.TW", "2376.TW", "3017.TW", "3035.TW", "3661.TW",
-            "6669.TW", "3008.TW", "3045.TW", "4938.TW", "5871.TW", "2891.TW", "2002.TW", "1605.TW", "2327.TW", "2379.TW",
-            "2886.TW", "2891.TW", "1216.TW", "2884.TW", "3711.TW", "2892.TW", "2885.TW", "5880.TW", "2880.TW", "1101.TW",
-            "3481.TW", "2409.TW", "6770.TW", "5347.TWO", "3293.TWO", "8069.TWO", "6147.TWO", "3105.TWO", "5483.TWO"
-        ]
+def get_data_smart(ticker):
+    is_tw = ticker.isdigit() or ticker.endswith('.TW') or ticker.endswith('.TWO')
+    yf_ticker = f"{ticker}.TW" if (ticker.isdigit()) else ticker
+    try: 
+        df = yf.Ticker(yf_ticker).history(period="10y")
+        if (df.empty or len(df) < 50) and is_tw:
+            yf_ticker = yf_ticker.replace('.TW', '.TWO') if '.TW' in yf_ticker else yf_ticker.replace('.TWO', '.TW')
+            df = yf.Ticker(yf_ticker).history(period="10y")
+    except Exception as e:
+        return None, f"數據下載異常: {str(e)}", is_tw
 
-def scan_market_panoramic(tickers):
-    data = yf.download(tickers, period="5d", group_by='ticker', threads=True)
-    res = []
-    for t in tickers:
-        try:
-            df = data[t].ffill().bfill()
-            if df.empty or len(df) < 2: continue
-            v_now, v_prev = df['Volume'].iloc[-1], df['Volume'].iloc[-2]
-            p_now, p_prev = df['Close'].iloc[-1], df['Close'].iloc[-2]
-            if v_prev == 0: continue
-            v_chg = (v_now - v_prev) / v_prev
-            p_chg = (p_now - p_prev) / p_prev
-            if v_chg > 0.5:
-                signal_type = "Bull" if p_chg > 0 else "Bear"
-                res.append({"Code": t, "Price": round(p_now,2), "Chg%": round(p_chg*100,2), "Vol_Chg%": round(v_chg*100,2), "Type": signal_type})
-        except: continue
-    return pd.DataFrame(res)
-
-# ==========================================
-# UI 介面
-# ==========================================
-with st.sidebar:
-    st.header("🧠 終極核心")
-    app_mode = st.radio("模式", ["個股深度分析 (管家版)", "美股全景掃描", "台股全景掃描"])
-    st.markdown("---")
+    if df is None or df.empty or len(df) < 250:
+        return None, "數據長度不足(需至少1年)", is_tw
     
-    if "個股" in app_mode:
-        market = st.selectbox("市場", ["tw 台股", "us 美股"])
-        raw = st.text_input("代碼", value="1590" if market == "tw 台股" else "NVDA")
-        if "台股" in market:
-            ticker = f"{raw}.TW" if not raw.endswith((".TW", ".TWO")) else raw
-            sym = "NT$"
-        else:
-            ticker = raw
-            sym = "$"
-        cap = st.number_input("總資金", value=100000)
+    df = df.ffill().bfill()
+    bm_ticker = "0050.TW" if is_tw else "SPY"
+    try:
+        bm = yf.Ticker(bm_ticker).history(period="10y")
+        df['BM_Close'] = bm['Close'].reindex(df.index, method='ffill').ffill().bfill()
+    except Exception:
+        df['BM_Close'] = df['Close']
+    return df, "OK", is_tw
+
+def add_triple_barrier(df, ub_mult=1.5, lb_mult=1.5, t_max=15):
+    # 建立副本避免快取污染
+    data = df.copy()
+    labels, hit_bars_list, n = [], [], len(data)
+    closes, atrs = data['Close'].values, data['ATR'].values
+    for i in range(n):
+        if i + t_max >= n:
+            labels.append(np.nan); hit_bars_list.append(np.nan); continue
+        hit, hit_bars = 0, t_max 
+        up_b, dn_b = closes[i] + (ub_mult * atrs[i]), closes[i] - (lb_mult * atrs[i])
+        for j in range(1, t_max + 1):
+            if closes[i+j] >= up_b: hit = 1; hit_bars = j; break
+            elif closes[i+j] <= dn_b: hit = 0; hit_bars = j; break
+        labels.append(hit); hit_bars_list.append(hit_bars) 
+    data['Target'] = labels; data['Hit_Bars'] = hit_bars_list
+    return data
+
+def feature_engineering(df):
+    # 不使用快取，防範 DataFrame 作為 Key 不穩定
+    data = df.copy()
+    try:
+        data['BM_MA50'] = data['BM_Close'].rolling(50).mean()
+        data['BM_MA200'] = data['BM_Close'].rolling(200).mean()
+        data['Market_Regime'] = (data['BM_MA50'] > data['BM_MA200']).astype(int)
+        data['MA20'], data['MA60'] = data['Close'].rolling(20).mean(), data['Close'].rolling(60).mean()
+        data['Price_to_MA20'], data['Price_to_MA60'] = data['Close'] / data['MA20'], data['Close'] / data['MA60']
+        data['RS'] = (data['Close'] / data['Close'].shift(20)) / (data['BM_Close'] / data['BM_Close'].shift(20))
+        ema12, ema26 = data['Close'].ewm(span=12, adjust=False).mean(), data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD_Hist'] = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
+        delta = data['Close'].diff()
+        gain, loss = (delta.where(delta > 0, 0)).rolling(14).mean(), (-delta.where(delta < 0, 0)).rolling(14).mean().replace(0, 0.001)
+        data['RSI'] = 100 - (100 / (1 + gain/loss))
+        data['Vol_Surge'] = data['Volume'] / data['Volume'].rolling(20).mean().replace(0, 1)
+        data['TR'] = np.maximum((data['High'] - data['Low']), np.maximum(abs(data['High'] - data['Close'].shift(1)), abs(data['Low'] - data['Close'].shift(1))))
+        data['ATR'], data['ATR_Pct'] = data['TR'].rolling(14).mean(), data['TR'].rolling(14).mean() / data['Close'] * 100 
+        data = data.dropna()
+        return add_triple_barrier(data) if len(data) > 150 else None
+    except Exception as e:
+        st.warning(f"特徵計算異常: {str(e)}")
+        return None
+
+# ==========================================
+# 2. AI 運算邏輯
+# ==========================================
+def get_calibrated_models(pos_weight):
+    inner_cv = TimeSeriesSplit(n_splits=3)
+    params = {'n_estimators': 30, 'max_depth': 4, 'scale_pos_weight': pos_weight, 'eval_metric': 'logloss', 'verbosity': 0}
+    xgb_cal = CalibratedClassifierCV(estimator=xgb.XGBClassifier(**params), method='sigmoid', cv=inner_cv)
+    rf_cal = CalibratedClassifierCV(estimator=RandomForestClassifier(n_estimators=30, max_depth=5, class_weight='balanced'), method='sigmoid', cv=inner_cv)
+    lr_cal = CalibratedClassifierCV(estimator=LogisticRegression(class_weight='balanced', max_iter=500), method='sigmoid', cv=inner_cv)
+    return xgb_cal, rf_cal, lr_cal
+
+def run_calibrated_kelly(ai_prob, oos_acc, baseline_acc, rrr=0.85):
+    if oos_acc <= baseline_acc or ai_prob <= 0.50: return 0.0
+    edge_weight = (oos_acc - baseline_acc) / (1.0 - baseline_acc)
+    raw_kelly = ai_prob - ((1.0 - ai_prob) / rrr)
+    return max(0.0, min(raw_kelly * edge_weight * 0.5, 0.25))
+
+# ==========================================
+# 3. UI 主循環
+# ==========================================
+st.sidebar.title("🧠 Quant Engine")
+user_input = st.sidebar.text_input("輸入代碼 (逗號分隔)", "NVDA, 2330, ONDS, HIMS")
+capital = st.sidebar.number_input("本金配置", value=100000)
+run_btn = st.sidebar.button("🚀 執行全市場驗證")
+
+if run_btn:
+    tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()]
+    summary_report, equity_curves = [], {}
+    progress_bar = st.progress(0)
+
+    for i, ticker in enumerate(tickers):
+        progress_bar.progress((i + 1) / len(tickers), text=f"分析中: {ticker}")
+        df_raw, status, is_tw = get_data_smart(ticker)
         
-        # --- [新增] 持倉設定 ---
-        st.markdown("### 💼 持倉設定 (Portfolio)")
-        has_pos = st.checkbox("✅ 我已持有此股")
-        cost_basis = 0.0
-        if has_pos:
-            cost_basis = st.number_input("平均買入成本", value=0.0)
+        if status != "OK":
+            st.error(f"{ticker}: {status}"); continue
             
-        run_btn = st.button("🚀 啟動分析")
-
-if "掃描" in app_mode:
-    t_type = "US" if "美股" in app_mode else "TW"
-    st.title(f"📡 {t_type} 全景爆量雷達")
-    if st.button("🔍 開始全景掃描"):
-        with st.spinner("掃描中..."):
-            df_s = scan_market_panoramic(get_tickers(t_type))
-            if not df_s.empty:
-                df_s = df_s.sort_values("Vol_Chg%", ascending=False).head(30)
-                for i, r in df_s.iterrows():
-                    color = "#00E676" if r['Type'] == "Bull" else "#FF5252"
-                    tag = "📈 多方攻擊" if r['Type'] == "Bull" else "📉 空方殺盤"
-                    st.markdown(f"""
-                    <div class="scan-card" style="display:flex; justify-content:space-between; align-items:center;">
-                        <div style="flex:1"><b>{r['Code']}</b> <span style="color:#aaa">${r['Price']}</span><br><span style="font-size:12px;color:{color}">{tag}</span></div>
-                        <div style="flex:1; text-align:right;"><span style="font-size:16px;color:#29B6F6">量增 +{r['Vol_Chg%']}%</span></div>
-                    </div>""", unsafe_allow_html=True)
-            else: st.warning("今日無顯著爆量股")
-
-elif "個股" in app_mode and 'run_btn' in locals() and run_btn:
-    with st.spinner(f"正在執行 {ticker} 終極健檢..."):
-        df_raw, stock_obj, status = get_data_smart(ticker, market)
-    
-    if status == "DATA_TOO_SHORT":
-        st.error(f"❌ {ticker} 歷史數據不足。")
-    elif df_raw is None:
-        st.error(f"❌ 無法獲取數據。")
-    else:
         df = feature_engineering(df_raw)
-        opt_data = get_options_data(stock_obj)
+        if df is None:
+            st.error(f"{ticker}: 樣本數不足以進行 Walk-Forward"); continue
+
+        # 核心驗證與回測
+        features = ['RSI', 'ATR_Pct', 'Price_to_MA20', 'Price_to_MA60', 'Vol_Surge', 'MACD_Hist', 'RS', 'Market_Regime']
+        X, y = df[features].values, df['Target'].values
+        if len(X) < 200: # ✅ 最小樣本守衛
+            st.error(f"{ticker}: 資料點過少"); continue
+
+        tscv = TimeSeriesSplit(n_splits=3)
+        oos_scores, bt_results = [], []
         
-        if df is None: st.error("❌ 有效數據不足。")
-        else:
-            res = run_ensemble_models(df, opt_data)
-            if res:
-                prob = res['final']
-                mu, ai, bl, kelly, sig = run_black_litterman(df, prob)
-                
-                curr = df.iloc[-1]
-                price = curr['Close']
-                ma60 = curr['MA60']
-                trend_ok = price > ma60
-                
-                # AI 決策
-                if res['con'] >= 2 and prob > 0.65 and trend_ok:
-                    color = "#00E676"; msg = "強力買進"; desc = "AI 高度共識且順勢"
-                elif res['con'] >= 1 and prob > 0.55 and trend_ok:
-                    color = "#29B6F6"; msg = "偏多操作"; desc = "趨勢正確"
-                elif not trend_ok:
-                    color = "#FFA15A"; msg = "觀望"; desc = "股價低於季線"
-                else:
-                    color = "#FF5252"; msg = "賣出/空手"; desc = "AI 看空"
+        for tr_idx, val_idx in tscv.split(X):
+            X_tr, X_val, y_tr, y_val = X[tr_idx], X[val_idx], y[tr_idx], y[val_idx]
+            scaler = StandardScaler()
+            X_tr_s, X_val_s = scaler.fit_transform(X_tr), scaler.transform(X_val)
+            
+            p_weight = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
+            m1, m2, m3 = get_calibrated_models(p_weight)
+            m1.fit(X_tr_s, y_tr); m2.fit(X_tr_s, y_tr); m3.fit(X_tr_s, y_tr)
+            
+            prob = (m1.predict_proba(X_val_s)[:, 1]*0.4 + m2.predict_proba(X_val_s)[:, 1]*0.3 + m3.predict_proba(X_val_s)[:, 1]*0.3)
+            oos_scores.append(accuracy_score(y_val, (prob > 0.5).astype(int)))
+            
+            dates, atrs, hits = df.index[val_idx], df['ATR_Pct'].values[val_idx], df['Hit_Bars'].values[val_idx]
+            for k in range(len(y_val)):
+                bt_results.append({'Date': dates[k], 'Prob': prob[k], 'Target': y_val[k], 'ATR_Pct': atrs[k], 'Hit_Bars': hits[k]})
 
-                st.title(f"{ticker} 決策報告")
-                
-                # [新增] 持倉損益卡
-                if has_pos and cost_basis > 0:
-                    pnl = (price - cost_basis) / cost_basis * 100
-                    pnl_money = (price - cost_basis) # 單股損益
-                    pnl_color = "#00E676" if pnl > 0 else "#FF5252"
-                    st.markdown(f"""
-                    <div class="pnl-card">
-                        <h3 style="color:#FFF; margin:0">💼 持倉損益監控</h3>
-                        <div style="display:flex; justify-content:space-around; align-items:center; margin-top:10px;">
-                            <div>
-                                <div style="color:#aaa; font-size:12px">您的成本</div>
-                                <div style="color:#FFF; font-weight:bold; font-size:20px">{sym}{cost_basis}</div>
-                            </div>
-                            <div>
-                                <div style="color:#aaa; font-size:12px">目前損益</div>
-                                <div style="color:{pnl_color}; font-weight:bold; font-size:28px">{pnl:+.2f}%</div>
-                            </div>
-                            <div>
-                                <div style="color:#aaa; font-size:12px">AI 建議</div>
-                                <div style="color:#FFF; font-weight:bold">{msg}</div>
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    # 空手時顯示一般決策
-                    st.markdown(f"""
-                    <div class="verdict-box" style="background-color:{color}22; border:2px solid {color}">
-                        <div class="action-text" style="color:{color}">{msg}</div>
-                        <div class="big-score" style="color:{color}">{int(prob*100)}%</div>
-                        <div>{desc}</div>
-                    </div>""", unsafe_allow_html=True)
-                
-                st.subheader("⚖️ AI 委員會")
-                c1, c2, c3 = st.columns(3)
-                def get_vote_color(p): return "#00E676" if p > 0.6 else ("#FF5252" if p < 0.4 else "#FFA15A")
-                with c1:
-                    st.markdown(f"""<div class="metric-box" style="border-left-color:{get_vote_color(res['xgb'])}">
-                    <b>XGBoost</b><br><span style="font-size:24px">{int(res['xgb']*100)}%</span></div>""", unsafe_allow_html=True)
-                with c2:
-                    st.markdown(f"""<div class="metric-box" style="border-left-color:{get_vote_color(res['rf'])}">
-                    <b>Random Forest</b><br><span style="font-size:24px">{int(res['rf']*100)}%</span></div>""", unsafe_allow_html=True)
-                with c3:
-                    st.markdown(f"""<div class="metric-box" style="border-left-color:{get_vote_color(res['lr'])}">
-                    <b>Logistic Reg</b><br><span style="font-size:24px">{int(res['lr']*100)}%</span></div>""", unsafe_allow_html=True)
-                
-                st.write("")
-                
-                col_opt, col_fund = st.columns([1, 1])
-                with col_opt:
-                    if opt_data:
-                        pcr = opt_data['pcr']
-                        pcr_c = "#00E676" if pcr > 1.2 or pcr < 0.6 else "#FFA15A"
-                        st.markdown(f"""
-                        <div class="opt-card">
-                            <h4 style="color:#FFF; margin:0">🟣 選擇權籌碼</h4>
-                            <div style="font-size:24px; font-weight:bold; color:{pcr_c}">PCR: {pcr}</div>
-                            <div>情緒: {opt_data['sent']}</div>
-                        </div>""", unsafe_allow_html=True)
-                    else:
-                        st.info("⚠️ 無選擇權數據")
-                with col_fund:
-                    st.markdown(f"""
-                    <div class="bl-card">
-                        <h4 style="color:#FFF; margin:0">💰 凱利資金配置</h4>
-                        <div style="font-size:24px; font-weight:bold; color:#FFF">{sym}{int(cap*kelly):,}</div>
-                        <div>建議配置: {int(kelly*100)}% (Max 50%)</div>
-                    </div>""", unsafe_allow_html=True)
+        oos_acc, base_acc = np.mean(oos_scores), max(y.mean(), 1-y.mean())
+        
+        # 今日預測
+        scaler_f = StandardScaler()
+        X_s = scaler_f.fit_transform(X)
+        m1_f, m2_f, m3_f = get_calibrated_models((len(y)-y.sum())/max(y.sum(),1))
+        m1_f.fit(X_s, y); m2_f.fit(X_s, y); m3_f.fit(X_s, y)
+        
+        X_latest = scaler_f.transform(df[features].tail(1).values)
+        today_prob = (m1_f.predict_proba(X_latest)[0,1]*0.4 + m2_f.predict_proba(X_latest)[0,1]*0.3 + m3_f.predict_proba(X_latest)[0,1]*0.3)
+        kelly = run_calibrated_kelly(today_prob, oos_acc, base_acc)
 
-                st.divider()
+        # 回測淨值 (狀態機)
+        bt_df = pd.DataFrame(bt_results).set_index('Date').sort_index()
+        bt_df = bt_df[~bt_df.index.duplicated(keep='first')]
+        daily_ret = pd.Series(0.0, index=df.index)
+        
+        # ✅ 時區哨兵值終極修復 (兼容 tz-aware 與 tz-naive)
+        in_trade_until = pd.Timestamp.min.tz_localize(df.index.tz) if df.index.tz else pd.Timestamp.min
+        
+        for date, row in bt_df.iterrows():
+            if date <= in_trade_until: continue
+            k_pos = run_calibrated_kelly(row['Prob'], oos_acc, base_acc)
+            if k_pos > 0:
+                ret = k_pos * (1.4 * row['ATR_Pct']/100 if row['Target']==1 else -1.6 * row['ATR_Pct']/100)
+                exit_idx = min(df.index.get_loc(date) + int(row['Hit_Bars']), len(df)-1)
+                daily_ret.loc[df.index[exit_idx]] = ret
+                in_trade_until = df.index[exit_idx]
+        
+        equity = (1 + daily_ret).cumprod()
+        display_name = f"{ticker}(TW)" if is_tw else ticker
+        equity_curves[display_name] = equity # ✅ 統一顯示名稱
+        
+        summary_report.append({
+            "代碼": display_name,
+            "Alpha": "✅" if oos_acc > base_acc else "❌",
+            "OOS勝率": f"{oos_acc*100:.1f}%",
+            "今日建議": "📈 BUY" if (kelly > 0 and oos_acc > base_acc) else "🛑 HOLD",
+            "倉位": f"{kelly*100:.1f}%",
+            "夏普": f"{np.sqrt(252)*daily_ret.mean()/(daily_ret.std()+1e-9):.2f}"
+        })
 
-                # 計算策略 (傳入成本價)
-                strat = calculate_strategy_levels(price, df, cost_basis if has_pos else 0)
-                
-                c_chart, c_plan = st.columns([2, 1])
-                with c_chart:
-                    st.subheader("📊 策略戰術圖")
-                    fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線")])
-                    fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='yellow', width=2), name='季線'))
-                    
-                    # 畫成本線
-                    if has_pos and cost_basis > 0:
-                        fig.add_hline(y=cost_basis, line_dash="solid", line_color="white", annotation_text="您的成本")
-                        
-                    fig.add_hline(y=strat['tp1'], line_dash="dash", line_color="#00E676", annotation_text="TP1")
-                    fig.add_hline(y=strat['dca1'], line_dash="dot", line_color="#FF5252", annotation_text="加碼1")
-                    fig.add_hline(y=strat['ts'], line_dash="solid", line_color="#29B6F6", annotation_text="移動鎖利")
-                    fig.update_layout(height=500, margin=dict(l=0,r=0,t=0,b=0))
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                with c_plan:
-                    st.subheader("📝 您的劇本")
-                    base_txt = f"基於成本 {cost_basis}" if has_pos else f"基於現價 {price}"
-                    st.caption(base_txt)
-                    
-                    st.markdown(f"""
-                    <div class="strategy-card" style="border-left-color:#00E676">
-                        <b>💰 獲利目標</b><br>
-                        <span class="tp-text">1. {sym}{strat['tp1']:.2f}</span> (賣3成)<br>
-                        <span class="tp-text">2. {sym}{strat['tp2']:.2f}</span> (賣5成)
-                    </div>
-                    <div class="strategy-card" style="border-left-color:#FF5252">
-                        <b>🛡️ 加碼防線</b><br>
-                        <span class="sl-text">1. {sym}{strat['dca1']:.2f}</span> (加10%)<br>
-                        <span class="sl-text">2. {sym}{strat['dca2']:.2f}</span> (加10%)
-                    </div>
-                    <div class="strategy-card" style="border-left-color:#29B6F6">
-                        <b>🛑 最終防線</b><br>
-                        <span class="ts-text">{sym}{strat['ts']:.2f}</span><br>
-                        <span style="font-size:12px;color:#aaa">跌破此線全數清倉</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+    # 輸出結果
+    st.subheader("🏆 全市場量化報告")
+    if summary_report:
+        st.table(pd.DataFrame(summary_report))
+        fig = go.Figure()
+        for name, curve in equity_curves.items():
+            if curve.iloc[-1] != 1.0:
+                fig.add_trace(go.Scatter(x=curve.index, y=curve, name=name))
+        fig.update_layout(template="plotly_dark", height=400, title="樣本外淨值推演", yaxis_type="log")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("請在側邊欄輸入代碼並點擊執行。")
