@@ -56,7 +56,6 @@ def get_data_smart(ticker):
     return df, "OK", is_tw
 
 def add_triple_barrier(df, ub_mult=1.5, lb_mult=1.5, t_max=15):
-    # 建立副本避免快取污染
     data = df.copy()
     labels, hit_bars_list, n = [], [], len(data)
     closes, atrs = data['Close'].values, data['ATR'].values
@@ -73,7 +72,6 @@ def add_triple_barrier(df, ub_mult=1.5, lb_mult=1.5, t_max=15):
     return data
 
 def feature_engineering(df):
-    # 不使用快取，防範 DataFrame 作為 Key 不穩定
     data = df.copy()
     try:
         data['BM_MA50'] = data['BM_Close'].rolling(50).mean()
@@ -139,8 +137,13 @@ if run_btn:
 
         # 核心驗證與回測
         features = ['RSI', 'ATR_Pct', 'Price_to_MA20', 'Price_to_MA60', 'Vol_Surge', 'MACD_Hist', 'RS', 'Market_Regime']
-        X, y = df[features].values, df['Target'].values
-        if len(X) < 200: # ✅ 最小樣本守衛
+        
+        # 💡 【重大修復】：過濾掉末端沒有標籤的數據，避免 NaN 進入 accuracy_score
+        train_df = df.dropna(subset=['Target'])
+        X, y = train_df[features].values, train_df['Target'].values
+        dates, atrs, hits = train_df.index, train_df['ATR_Pct'].values, train_df['Hit_Bars'].values
+        
+        if len(X) < 200: 
             st.error(f"{ticker}: 資料點過少"); continue
 
         tscv = TimeSeriesSplit(n_splits=3)
@@ -158,13 +161,13 @@ if run_btn:
             prob = (m1.predict_proba(X_val_s)[:, 1]*0.4 + m2.predict_proba(X_val_s)[:, 1]*0.3 + m3.predict_proba(X_val_s)[:, 1]*0.3)
             oos_scores.append(accuracy_score(y_val, (prob > 0.5).astype(int)))
             
-            dates, atrs, hits = df.index[val_idx], df['ATR_Pct'].values[val_idx], df['Hit_Bars'].values[val_idx]
+            val_dates, val_atrs, val_hits = dates[val_idx], atrs[val_idx], hits[val_idx]
             for k in range(len(y_val)):
-                bt_results.append({'Date': dates[k], 'Prob': prob[k], 'Target': y_val[k], 'ATR_Pct': atrs[k], 'Hit_Bars': hits[k]})
+                bt_results.append({'Date': val_dates[k], 'Prob': prob[k], 'Target': y_val[k], 'ATR_Pct': val_atrs[k], 'Hit_Bars': val_hits[k]})
 
         oos_acc, base_acc = np.mean(oos_scores), max(y.mean(), 1-y.mean())
         
-        # 今日預測
+        # 今日預測 (使用包含最新一日的完整 df)
         scaler_f = StandardScaler()
         X_s = scaler_f.fit_transform(X)
         m1_f, m2_f, m3_f = get_calibrated_models((len(y)-y.sum())/max(y.sum(),1))
@@ -179,7 +182,6 @@ if run_btn:
         bt_df = bt_df[~bt_df.index.duplicated(keep='first')]
         daily_ret = pd.Series(0.0, index=df.index)
         
-        # ✅ 時區哨兵值終極修復 (兼容 tz-aware 與 tz-naive)
         in_trade_until = pd.Timestamp.min.tz_localize(df.index.tz) if df.index.tz else pd.Timestamp.min
         
         for date, row in bt_df.iterrows():
@@ -193,7 +195,7 @@ if run_btn:
         
         equity = (1 + daily_ret).cumprod()
         display_name = f"{ticker}(TW)" if is_tw else ticker
-        equity_curves[display_name] = equity # ✅ 統一顯示名稱
+        equity_curves[display_name] = equity 
         
         summary_report.append({
             "代碼": display_name,
