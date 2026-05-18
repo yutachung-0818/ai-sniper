@@ -15,7 +15,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="Quant Engine", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quant Engine v10.5", layout="wide", initial_sidebar_state="expanded")
 
 # --- CSS 樣式 ---
 st.markdown("""
@@ -88,6 +88,10 @@ def feature_engineering(df):
         data['Vol_Surge'] = data['Volume'] / data['Volume'].rolling(20).mean().replace(0, 1)
         data['TR'] = np.maximum((data['High'] - data['Low']), np.maximum(abs(data['High'] - data['Close'].shift(1)), abs(data['Low'] - data['Close'].shift(1))))
         data['ATR'], data['ATR_Pct'] = data['TR'].rolling(14).mean(), data['TR'].rolling(14).mean() / data['Close'] * 100 
+        
+        # 💡 【效能修復】：使用 raw=True 與 numpy array indexing 大幅降低運算時間
+        data['HV_Rank'] = data['ATR_Pct'].rolling(window=252, min_periods=50).apply(lambda x: (x <= x[-1]).mean() * 100, raw=True)
+        
         data = data.dropna()
         return add_triple_barrier(data) if len(data) > 150 else None
     except Exception as e:
@@ -114,8 +118,8 @@ def run_calibrated_kelly(ai_prob, oos_acc, baseline_acc, rrr=0.85):
 # ==========================================
 # 3. UI 主循環
 # ==========================================
-st.sidebar.title("🧠 Quant Engine")
-user_input = st.sidebar.text_input("輸入代碼 (逗號分隔)", "NVDA, 2330, ONDS, HIMS")
+st.sidebar.title("🧠 Quant Engine v10.5")
+user_input = st.sidebar.text_input("輸入代碼 (逗號分隔)", "NVDA, MSTR, PLTR, 2330")
 capital = st.sidebar.number_input("本金配置", value=100000)
 run_btn = st.sidebar.button("🚀 執行全市場驗證")
 
@@ -133,17 +137,16 @@ if run_btn:
             
         df = feature_engineering(df_raw)
         if df is None:
-            st.error(f"{ticker}: 樣本數不足以進行 Walk-Forward"); continue
+            st.error(f"{ticker}: 樣本數不足以進行 Walk-Forward (可能是上市不滿兩年的新股)"); continue
 
-        # 核心驗證與回測
-        features = ['RSI', 'ATR_Pct', 'Price_to_MA20', 'Price_to_MA60', 'Vol_Surge', 'MACD_Hist', 'RS', 'Market_Regime']
+        features = ['RSI', 'ATR_Pct', 'Price_to_MA20', 'Price_to_MA60', 'Vol_Surge', 'MACD_Hist', 'RS', 'Market_Regime', 'HV_Rank']
         
         train_df = df.dropna(subset=['Target'])
         X, y = train_df[features].values, train_df['Target'].values
         dates, atrs, hits = train_df.index, train_df['ATR_Pct'].values, train_df['Hit_Bars'].values
         
         if len(X) < 200: 
-            st.error(f"{ticker}: 資料點過少"); continue
+            st.error(f"{ticker}: 有效交易資料點過少"); continue
 
         tscv = TimeSeriesSplit(n_splits=3)
         oos_scores, bt_results = [], []
@@ -166,22 +169,19 @@ if run_btn:
 
         oos_acc, base_acc = np.mean(oos_scores), max(y.mean(), 1-y.mean())
         
-        # 今日預測
         scaler_f = StandardScaler()
         X_s = scaler_f.fit_transform(X)
         m1_f, m2_f, m3_f = get_calibrated_models((len(y)-y.sum())/max(y.sum(),1))
         m1_f.fit(X_s, y); m2_f.fit(X_s, y); m3_f.fit(X_s, y)
         
-        X_latest = scaler_f.transform(df[features].tail(1).values)
+        X_latest = scaler_f.transform(df[features].dropna().tail(1).values)
         today_prob = (m1_f.predict_proba(X_latest)[0,1]*0.4 + m2_f.predict_proba(X_latest)[0,1]*0.3 + m3_f.predict_proba(X_latest)[0,1]*0.3)
         kelly = run_calibrated_kelly(today_prob, oos_acc, base_acc)
 
-        # 回測淨值 (狀態機)
         bt_df = pd.DataFrame(bt_results).set_index('Date').sort_index()
         bt_df = bt_df[~bt_df.index.duplicated(keep='first')]
         daily_ret = pd.Series(0.0, index=df.index)
         
-        # ✅ 使用 2000 年作為安全的過往哨兵值，避開 pd.Timestamp.min 的底層溢位崩潰
         in_trade_until = pd.Timestamp('2000-01-01', tz=df.index.tz) if df.index.tz else pd.Timestamp('2000-01-01')
         
         for date, row in bt_df.iterrows():
@@ -197,16 +197,29 @@ if run_btn:
         display_name = f"{ticker}(TW)" if is_tw else ticker
         equity_curves[display_name] = equity 
         
+        latest_hvr = df['HV_Rank'].iloc[-1]
+        is_buy = (kelly > 0 and oos_acc > base_acc)
+        
+        if latest_hvr > 80:
+            vol_status = f"🔴 高波動 ({latest_hvr:.0f}%)"
+            market_desc = "動能強烈，AI 已將高波動風險納入決策評估" if is_buy else "劇烈震盪，方向不明朗"
+        elif latest_hvr < 20:
+            vol_status = f"🔵 低壓縮 ({latest_hvr:.0f}%)"
+            market_desc = "壓縮後表態，AI 已調校極低動能下的預測權重" if is_buy else "動能枯竭，靜待市場表態"
+        else:
+            vol_status = f"⚪ 常態 ({latest_hvr:.0f}%)"
+            market_desc = "常態波動，依量化紀律執行" if is_buy else "缺乏超額勝率，觀望"
+
         summary_report.append({
             "代碼": display_name,
             "Alpha": "✅" if oos_acc > base_acc else "❌",
-            "OOS勝率": f"{oos_acc*100:.1f}%",
-            "今日建議": "📈 BUY" if (kelly > 0 and oos_acc > base_acc) else "🛑 HOLD",
+            "今日建議": "📈 BUY" if is_buy else "🛑 HOLD",
+            "波動位階": vol_status,
+            "市場狀態描述": market_desc,
             "倉位": f"{kelly*100:.1f}%",
-            "夏普": f"{np.sqrt(252)*daily_ret.mean()/(daily_ret.std()+1e-9):.2f}"
+            "十年夏普": f"{np.sqrt(252)*daily_ret.mean()/(daily_ret.std()+1e-9):.2f}"
         })
 
-    # 輸出結果
     st.subheader("🏆 全市場量化報告")
     if summary_report:
         st.table(pd.DataFrame(summary_report))
